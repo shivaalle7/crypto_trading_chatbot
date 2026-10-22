@@ -1,359 +1,255 @@
+"""CoinGecko market data utilities and technical indicators."""
 from __future__ import annotations
 
-import os
-from datetime import datetime
-import requests
+from functools import lru_cache
+from typing import Any
+
+import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
-import streamlit as st
-from dotenv import load_dotenv
+import requests
 
-from market_data import (
-    MarketDataError,
-    add_technical_indicators,
-    get_coin_history,
-    get_markets,
-    search_coins,
-)
+BASE_URL = "https://api.coingecko.com/api/v3"
+TIMEOUT = 15
+SESSION = requests.Session()
+SESSION.headers.update({
+    "accept": "application/json",
+    "User-Agent": "CryptoMindAI/1.1 (Streamlit app)",
+})
 
-load_dotenv()
 
-st.set_page_config(
-    page_title="CryptoMind AI",
-    page_icon="₿",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+class MarketDataError(RuntimeError):
+    """User-friendly error raised when market data cannot be retrieved."""
 
-st.markdown("""
-<style>
-    .block-container {padding-top: 1.5rem; padding-bottom: 2rem;}
-    .main-title {font-size: 2.4rem; font-weight: 800; margin-bottom: 0;}
-    .sub-title {opacity: .75; margin-top: .2rem; margin-bottom: 1.2rem;}
-    div[data-testid="stMetric"] {border: 1px solid rgba(128,128,128,.22);
-      border-radius: 12px; padding: 14px;}
-    .small-note {font-size: .85rem; opacity: .75;}
-</style>
-""", unsafe_allow_html=True)
 
-CURRENCIES = {
-    "USD": "US Dollar", "INR": "Indian Rupee", "EUR": "Euro",
-    "GBP": "British Pound", "JPY": "Japanese Yen", "CAD": "Canadian Dollar",
-    "AUD": "Australian Dollar", "SGD": "Singapore Dollar",
-}
-
-def money(value, currency="USD"):
-    if value is None or pd.isna(value):
-        return "—"
+def _get(path: str, params: dict | None = None) -> Any:
     try:
-        value = float(value)
-    except (TypeError, ValueError):
-        return "—"
-    if abs(value) >= 1:
-        return f"{currency} {value:,.2f}"
-    return f"{currency} {value:.8f}".rstrip("0").rstrip(".")
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def currency_rates(base: str):
-    url = f"https://open.er-api.com/v6/latest/{base.upper()}"
-    try:
-        response = requests.get(url, timeout=12)
+        response = SESSION.get(f"{BASE_URL}{path}", params=params, timeout=TIMEOUT)
+        if response.status_code == 429:
+            raise MarketDataError(
+                "CoinGecko rate limit reached. Wait a little and try again."
+            )
         response.raise_for_status()
-        payload = response.json()
-        if payload.get("result") != "success":
-            raise ValueError("Currency service returned an unsuccessful result.")
-        return payload["rates"], payload.get("time_last_update_utc", "Unknown")
-    except Exception as exc:
-        raise RuntimeError(
-            "Currency conversion is temporarily unavailable. Check your connection and try again."
+        return response.json()
+    except MarketDataError:
+        raise
+    except requests.Timeout as exc:
+        raise MarketDataError("CoinGecko request timed out. Please try again.") from exc
+    except requests.RequestException as exc:
+        raise MarketDataError(
+            "Could not connect to CoinGecko. Check your internet connection."
         ) from exc
+    except ValueError as exc:
+        raise MarketDataError("CoinGecko returned an invalid response.") from exc
 
 
-def get_ai_client():
-    key = os.getenv("GROQ_API_KEY", "").strip()
-    if not key or key == "your_groq_api_key_here":
-        return None, "Add your GROQ_API_KEY to the .env file to enable AI features."
-    try:
-        from langchain_groq import ChatGroq
-        model_name = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip()
-        temperature = float(os.getenv("GROQ_TEMPERATURE", "0.4"))
-        return ChatGroq(
-            model=model_name,
-            temperature=temperature,
-            groq_api_key=key,
-        ), None
-    except Exception as exc:
-        return None, f"Could not initialize the Groq client: {exc}"
+@lru_cache(maxsize=32)
+def get_markets(
+    vs_currency: str = "usd",
+    page: int = 1,
+    per_page: int = 50,
+) -> pd.DataFrame:
+    """Get top coins by market cap. Cached for 60 seconds at app level."""
+    payload = _get(
+        "/coins/markets",
+        {
+            "vs_currency": vs_currency.lower(),
+            "order": "market_cap_desc",
+            "per_page": min(max(int(per_page), 1), 100),
+            "page": max(int(page), 1),
+            "sparkline": "false",
+            "price_change_percentage": "24h",
+        },
+    )
+    df = pd.DataFrame(payload)
+    if df.empty:
+        return df
+    columns = [
+        "id", "symbol", "name", "image", "current_price", "market_cap",
+        "market_cap_rank", "total_volume", "high_24h", "low_24h",
+        "price_change_24h", "price_change_percentage_24h",
+        "circulating_supply", "last_updated",
+    ]
+    return df[[column for column in columns if column in df.columns]]
 
 
-def invoke_ai(prompt: str, system: str = "You are CryptoMind AI, a cautious cryptocurrency market information assistant.") -> str:
-    client, error = get_ai_client()
-    if error:
-        raise RuntimeError(error)
-    result = client.invoke([
-        ("system", system),
-        ("human", prompt),
-    ])
-    return str(result.content)
+def search_coins(query: str) -> list[dict]:
+    """Search CoinGecko coin catalogue by name or ticker symbol."""
+    query = (query or "").strip()
+    if not query:
+        return []
+    payload = _get("/search", {"query": query})
+    return payload.get("coins", [])[:20]
 
 
-def fmt_compact(value):
-    if value is None or pd.isna(value):
-        return "—"
-    value = float(value)
-    if abs(value) >= 1e12:
-        return f"{value / 1e12:.2f}T"
-    if abs(value) >= 1e9:
-        return f"{value / 1e9:.2f}B"
-    if abs(value) >= 1e6:
-        return f"{value / 1e6:.2f}M"
-    if abs(value) >= 1e3:
-        return f"{value / 1e3:.2f}K"
-    return f"{value:,.2f}"
-
-
-# Sidebar controls
-st.sidebar.markdown("## ₿ CryptoMind AI")
-st.sidebar.caption("Crypto market dashboard and AI assistant")
-currency = st.sidebar.selectbox("Display currency", list(CURRENCIES), index=0)
-period_labels = {"1 day": 1, "7 days": 7, "14 days": 14, "30 days": 30, "90 days": 90, "180 days": 180, "1 year": 365}
-period_label = st.sidebar.selectbox("Chart history", list(period_labels), index=4)
-days = period_labels[period_label]
-top_n = st.sidebar.slider("Coins in market table", 10, 100, 30, step=10)
-st.sidebar.markdown("---")
-st.sidebar.caption("Market data: CoinGecko public API")
-st.sidebar.caption("AI features require a Groq API key.")
-
-st.markdown('<div class="main-title">₿ CryptoMind AI</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-title">Live cryptocurrency markets, technical indicators, and AI-powered explanations.</div>', unsafe_allow_html=True)
-
-tabs = st.tabs(["📊 Market Dashboard", "🔎 Coin Explorer", "🤖 AI Assistant", "💱 Currency Converter"])
-
-# Shared market snapshot
-try:
-    with st.spinner("Loading market data from CoinGecko…"):
-        markets = get_markets(currency.lower(), per_page=top_n)
-    if markets.empty:
-        st.warning("CoinGecko returned no market data. Try again shortly.")
-except MarketDataError as exc:
-    markets = pd.DataFrame()
-    st.error(str(exc))
-
-with tabs[0]:
-    if not markets.empty:
-        c1, c2, c3, c4 = st.columns(4)
-        first = markets.iloc[0]
-        c1.metric("Top coin", str(first["name"]), f"Rank #{int(first['market_cap_rank'])}" if pd.notna(first.get("market_cap_rank")) else None)
-        total_cap = markets["market_cap"].fillna(0).sum() if "market_cap" in markets else 0
-        total_vol = markets["total_volume"].fillna(0).sum() if "total_volume" in markets else 0
-        c2.metric(f"Combined cap (top {len(markets)})", f"{currency.upper()} {fmt_compact(total_cap)}")
-        c3.metric(f"Combined 24h volume", f"{currency.upper()} {fmt_compact(total_vol)}")
-        changes = markets["price_change_percentage_24h"].dropna() if "price_change_percentage_24h" in markets else pd.Series(dtype=float)
-        advancing = int((changes > 0).sum())
-        c4.metric("Gainers in loaded list", f"{advancing}/{len(changes)}")
-
-        st.subheader("Top cryptocurrencies")
-        show = markets.copy()
-        show["Price"] = show["current_price"].apply(lambda x: money(x, currency.upper()))
-        show["24h change"] = show["price_change_percentage_24h"].apply(
-            lambda x: f"{x:+.2f}%" if pd.notna(x) else "—"
-        )
-        show["Market cap"] = show["market_cap"].apply(lambda x: f"{currency.upper()} {fmt_compact(x)}")
-        show["24h volume"] = show["total_volume"].apply(lambda x: f"{currency.upper()} {fmt_compact(x)}")
-        display_cols = {
-            "market_cap_rank": "Rank", "name": "Coin", "symbol": "Symbol",
-            "Price": "Price", "24h change": "24h change",
-            "Market cap": "Market cap", "24h volume": "24h volume",
-        }
-        display_df = show[[col for col in display_cols if col in show.columns]].rename(columns=display_cols)
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
-
-        st.subheader("24-hour performance")
-        plot_df = markets.dropna(subset=["price_change_percentage_24h"]).head(15).copy()
-        if not plot_df.empty:
-            plot_df = plot_df.sort_values("price_change_percentage_24h")
-            fig = go.Figure(go.Bar(
-                x=plot_df["price_change_percentage_24h"],
-                y=plot_df["name"],
-                orientation="h",
-                text=plot_df["price_change_percentage_24h"].map(lambda x: f"{x:+.2f}%"),
-                textposition="outside",
-                hovertemplate="%{y}: %{x:.2f}%<extra></extra>",
-            ))
-            fig.update_layout(height=470, xaxis_title="24-hour change (%)", yaxis_title="", margin=dict(l=5, r=40, t=15, b=5))
-            st.plotly_chart(fig, use_container_width=True)
+@lru_cache(maxsize=128)
+def get_coin_history(
+    coin_id: str,
+    vs_currency: str = "usd",
+    days: int = 90,
+) -> pd.DataFrame:
+    """Get price history and volume for a CoinGecko coin ID."""
+    allowed_days = {1, 7, 14, 30, 90, 180, 365, "max"}
+    if days not in allowed_days:
+        days = 90
+    params = {
+        "vs_currency": vs_currency.lower(),
+        "days": days,
+    }
+    if days != 1:
+        params["interval"] = "daily"
+    payload = _get(f"/coins/{coin_id}/market_chart", params)
+    prices = payload.get("prices", [])
+    volumes = payload.get("total_volumes", [])
+    if not prices:
+        raise MarketDataError("No historical price data was returned for this coin.")
+    df = pd.DataFrame(prices, columns=["timestamp_ms", "price"])
+    df["date"] = pd.to_datetime(df["timestamp_ms"], unit="ms", utc=True).dt.tz_convert(None)
+    if volumes:
+        vol_df = pd.DataFrame(volumes, columns=["volume_timestamp_ms", "volume"])
+        df = df.merge(vol_df, left_on="timestamp_ms", right_on="volume_timestamp_ms", how="left")
     else:
-        st.info("Market dashboard is unavailable until CoinGecko returns data.")
+        df["volume"] = np.nan
+    df = df.drop_duplicates("date").sort_values("date").reset_index(drop=True)
+    return df[["date", "price", "volume"]]
 
-with tabs[1]:
-    st.subheader("Explore a cryptocurrency")
-    search_query = st.text_input("Search by coin name or symbol", placeholder="e.g. bitcoin, ethereum, sol")
-    search_results = []
-    if search_query.strip():
-        try:
-            with st.spinner("Searching coins…"):
-                search_results = search_coins(search_query)
-        except MarketDataError as exc:
-            st.warning(str(exc))
 
-    if search_results:
-        options = {f"{coin['name']} ({coin['symbol'].upper()}) · {coin['id']}": coin for coin in search_results}
-        selected_label = st.selectbox("Select a result", list(options))
-        selected_coin = options[selected_label]
-        coin_id = selected_coin["id"]
-        coin_name = selected_coin["name"]
-        coin_symbol = selected_coin["symbol"].upper()
-    elif search_query.strip():
-        st.info("No results found. Try a different name or symbol.")
-        coin_id, coin_name, coin_symbol = "bitcoin", "Bitcoin", "BTC"
-    elif not markets.empty:
-        market_options = {
-            f"{row['name']} ({str(row['symbol']).upper()})": row
-            for _, row in markets.iterrows()
-        }
-        chosen = st.selectbox("Or choose from popular coins", list(market_options))
-        chosen_row = market_options[chosen]
-        coin_id, coin_name, coin_symbol = chosen_row["id"], chosen_row["name"], str(chosen_row["symbol"]).upper()
-    else:
-        coin_id, coin_name, coin_symbol = "bitcoin", "Bitcoin", "BTC"
+def add_technical_indicators(history: pd.DataFrame) -> pd.DataFrame:
+    """Calculate SMA20, SMA50, RSI14, MACD, signal, and histogram."""
+    df = history.copy()
+    close = pd.to_numeric(df["price"], errors="coerce")
+    df["SMA 20"] = close.rolling(20, min_periods=1).mean()
+    df["SMA 50"] = close.rolling(50, min_periods=1).mean()
 
-    try:
-        with st.spinner(f"Loading {coin_name} history…"):
-            history = add_technical_indicators(get_coin_history(coin_id, currency.lower(), days))
-        latest = history.iloc[-1]
-        prev = history.iloc[-2] if len(history) > 1 else latest
-        change = ((latest["price"] / prev["price"]) - 1) * 100 if prev["price"] else 0
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Latest price", money(latest["price"], currency.upper()), f"{change:+.2f}% vs previous data point")
-        m2.metric("RSI (14)", f"{latest['RSI 14']:.2f}" if pd.notna(latest["RSI 14"]) else "Not enough data")
-        m3.metric("SMA (20)", money(latest["SMA 20"], currency.upper()))
-        m4.metric("SMA (50)", money(latest["SMA 50"], currency.upper()))
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    rsi = rsi.mask((avg_loss == 0) & (avg_gain > 0), 100)
+    df["RSI 14"] = rsi
 
-        st.subheader(f"{coin_name} ({coin_symbol}) price history")
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=history["date"], y=history["price"], name="Price", mode="lines"))
-        fig.add_trace(go.Scatter(x=history["date"], y=history["SMA 20"], name="SMA 20", mode="lines"))
-        fig.add_trace(go.Scatter(x=history["date"], y=history["SMA 50"], name="SMA 50", mode="lines"))
-        fig.update_layout(height=470, xaxis_title="Date (UTC)", yaxis_title=f"Price ({currency.upper()})", hovermode="x unified", legend=dict(orientation="h", y=1.08))
-        st.plotly_chart(fig, use_container_width=True)
+    ema12 = close.ewm(span=12, adjust=False, min_periods=1).mean()
+    ema26 = close.ewm(span=26, adjust=False, min_periods=1).mean()
+    df["MACD"] = ema12 - ema26
+    df["MACD Signal"] = df["MACD"].ewm(span=9, adjust=False, min_periods=1).mean()
+    df["MACD Histogram"] = df["MACD"] - df["MACD Signal"]
+    return df
 
-        left, right = st.columns(2)
-        with left:
-            st.subheader("RSI (14)")
-            rsi_fig = go.Figure()
-            rsi_fig.add_trace(go.Scatter(x=history["date"], y=history["RSI 14"], name="RSI", mode="lines"))
-            rsi_fig.add_hline(y=70, line_dash="dash")
-            rsi_fig.add_hline(y=30, line_dash="dash")
-            rsi_fig.update_layout(height=300, yaxis=dict(range=[0, 100]), xaxis_title="Date (UTC)")
-            st.plotly_chart(rsi_fig, use_container_width=True)
-        with right:
-            st.subheader("MACD")
-            macd_fig = go.Figure()
-            macd_fig.add_trace(go.Scatter(x=history["date"], y=history["MACD"], name="MACD"))
-            macd_fig.add_trace(go.Scatter(x=history["date"], y=history["MACD Signal"], name="Signal"))
-            macd_fig.add_trace(go.Bar(x=history["date"], y=history["MACD Histogram"], name="Histogram"))
-            macd_fig.update_layout(height=300, xaxis_title="Date (UTC)")
-            st.plotly_chart(macd_fig, use_container_width=True)
 
-        with st.expander("View technical indicator data"):
-            st.dataframe(history.tail(30).sort_values("date", ascending=False), use_container_width=True, hide_index=True)
+def get_simple_price(
+    coin_ids: list[str],
+    vs_currency: str = "usd",
+) -> dict:
+    """Fetch simple prices for one or more CoinGecko coin IDs."""
+    if not coin_ids:
+        return {}
+    return _get(
+        "/simple/price",
+        {
+            "ids": ",".join(dict.fromkeys(coin_ids)),
+            "vs_currencies": vs_currency.lower(),
+            "include_24hr_change": "true",
+            "include_market_cap": "true",
+            "include_24hr_vol": "true",
+        },
+    )
 
-        st.markdown("#### AI interpretation")
-        if st.button("Explain current indicators with AI", key="explain_indicators"):
-            prompt = f"""
-Explain these crypto indicators in plain English. Do not claim certainty or provide guaranteed predictions.
-Coin: {coin_name} ({coin_symbol})
-Currency: {currency.upper()}
-Latest price: {latest['price']}
-RSI(14): {latest['RSI 14']}
-SMA20: {latest['SMA 20']}
-SMA50: {latest['SMA 50']}
-MACD: {latest['MACD']}
-MACD signal: {latest['MACD Signal']}
-MACD histogram: {latest['MACD Histogram']}
-Give: (1) what each value generally suggests, (2) possible bullish/bearish signals, (3) uncertainty and risks.
-"""
-            try:
-                with st.spinner("Generating explanation…"):
-                    st.write(invoke_ai(prompt))
-            except Exception as exc:
-                st.error(str(exc))
-    except MarketDataError as exc:
-        st.error(str(exc))
 
-with tabs[2]:
-    st.subheader("CryptoMind AI Assistant")
-    st.caption("Ask about market concepts, coin metrics, risk, or the indicators shown in the Explorer.")
-    if "chat_messages" not in st.session_state:
-        st.session_state.chat_messages = [
-            {"role": "assistant", "content": "Hi! I'm CryptoMind AI. I can explain crypto concepts, market metrics, and technical indicators. I don't provide guaranteed price predictions."}
-        ]
-    for message in st.session_state.chat_messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+def find_market_coins(query: str, vs_currency: str = "usd", limit: int = 100) -> pd.DataFrame:
+    """Find matching coins from current market listing using name, symbol, or ID."""
+    query = (query or "").strip().lower()
+    if not query:
+        return pd.DataFrame()
+    df = get_markets(vs_currency, per_page=limit)
+    if df.empty:
+        return df
+    mask = (
+        df["name"].astype(str).str.lower().str.contains(query, regex=False)
+        | df["symbol"].astype(str).str.lower().eq(query)
+        | df["id"].astype(str).str.lower().str.contains(query, regex=False)
+    )
+    return df.loc[mask].copy()
 
-    user_question = st.chat_input("Ask a crypto question…")
-    if user_question:
-        st.session_state.chat_messages.append({"role": "user", "content": user_question})
-        with st.chat_message("user"):
-            st.markdown(user_question)
-        recent_history = st.session_state.chat_messages[-9:]
-        transcript = "\n".join(
-            f"{m['role'].capitalize()}: {m['content']}" for m in recent_history
+
+def forecast_coin_price(
+    coin_id: str,
+    target_date,
+    vs_currency: str = "usd",
+    history_days: int = 365,
+) -> dict:
+    """Create an illustrative statistical projection for any CoinGecko coin ID.
+
+    This is a simple log-return drift/volatility baseline, not a validated
+    forecasting model and not investment advice. Long horizons are highly uncertain.
+    """
+    target = pd.Timestamp(target_date).tz_localize(None).normalize()
+    today = pd.Timestamp.now(tz="UTC").tz_localize(None).normalize()
+    horizon_days = int((target - today).days)
+    if horizon_days < 1:
+        raise MarketDataError("Choose a target date at least one day in the future.")
+
+    history = get_coin_history(coin_id, vs_currency, history_days).copy()
+    history["price"] = pd.to_numeric(history["price"], errors="coerce")
+    history = history.dropna(subset=["price"]).sort_values("date")
+    if len(history) < 20:
+        raise MarketDataError("Not enough historical price data to create a projection.")
+
+    prices = history["price"].astype(float)
+    current_price = float(prices.iloc[-1])
+    if current_price <= 0:
+        raise MarketDataError("The latest price is invalid, so a projection cannot be calculated.")
+
+    # Use recent daily log returns and limit extreme outliers' effect on drift.
+    log_returns = np.log(prices / prices.shift(1)).replace([np.inf, -np.inf], np.nan).dropna()
+    recent_returns = log_returns.tail(min(90, len(log_returns)))
+    if len(recent_returns) < 10:
+        raise MarketDataError("Not enough recent return observations to create a projection.")
+    clipped_drift = recent_returns.clip(
+        lower=recent_returns.quantile(0.05), upper=recent_returns.quantile(0.95)
+    )
+    daily_drift = float(clipped_drift.mean())
+    daily_volatility = float(recent_returns.std(ddof=1))
+
+    projected = current_price * float(np.exp(daily_drift * horizon_days))
+    uncertainty = daily_volatility * float(np.sqrt(horizon_days)) * 1.96
+    lower = current_price * float(np.exp(daily_drift * horizon_days - uncertainty))
+    upper = current_price * float(np.exp(daily_drift * horizon_days + uncertainty))
+
+    # Keep chart path illustrative: linearly spaced log-price scenarios.
+    future_dates = pd.date_range(start=today + pd.Timedelta(days=1), periods=horizon_days, freq="D")
+    elapsed = np.arange(1, horizon_days + 1, dtype=float)
+    center_path = current_price * np.exp(daily_drift * elapsed)
+    band = daily_volatility * np.sqrt(elapsed) * 1.96
+    forecast_frame = pd.DataFrame({
+        "date": future_dates,
+        "projected_price": center_path,
+        "lower_range": current_price * np.exp(daily_drift * elapsed - band),
+        "upper_range": current_price * np.exp(daily_drift * elapsed + band),
+    })
+    return {
+        "coin_id": coin_id,
+        "currency": vs_currency.upper(),
+        "as_of": history["date"].iloc[-1],
+        "target_date": target,
+        "horizon_days": horizon_days,
+        "current_price": current_price,
+        "projected_price": projected,
+        "lower_range": lower,
+        "upper_range": upper,
+        "daily_volatility": daily_volatility,
+        "history_points": len(history),
+        "forecast_frame": forecast_frame,
+    }
+
+
+def get_coin_price(coin_id: str, vs_currency: str = "usd") -> dict:
+    """Fetch a single coin's latest price and 24-hour metrics in the requested currency."""
+    data = get_simple_price([coin_id], vs_currency)
+    coin = data.get(coin_id)
+    if not coin or coin.get(vs_currency.lower()) is None:
+        raise MarketDataError(
+            f"No {vs_currency.upper()} price is currently available for {coin_id}."
         )
-        prompt = (
-            "Answer the user's cryptocurrency question clearly and conversationally. "
-            "Distinguish facts from uncertainty. Do not claim access to live prices unless "
-            "they are explicitly included in the prompt. Do not give guaranteed predictions. "
-            "Mention risk and avoid presenting this as personalized financial advice.\n\n"
-            + transcript
-        )
-        with st.chat_message("assistant"):
-            try:
-                with st.spinner("Thinking…"):
-                    answer = invoke_ai(prompt)
-                st.markdown(answer)
-                st.session_state.chat_messages.append({"role": "assistant", "content": answer})
-            except Exception as exc:
-                error_text = str(exc)
-                st.error(error_text)
-                st.session_state.chat_messages.append({"role": "assistant", "content": f"Sorry, I couldn't answer that just now. {error_text}"})
-
-    if st.button("Clear chat history"):
-        st.session_state.chat_messages = []
-        st.rerun()
-
-with tabs[3]:
-    st.subheader("Currency converter")
-    st.caption("Exchange rates are from ExchangeRate-API's public latest-rate endpoint and may be delayed.")
-    col1, col2, col3 = st.columns([2, 1, 2])
-    with col1:
-        amount = st.number_input("Amount", min_value=0.0, value=100.0, step=10.0)
-        base = st.selectbox("From", list(CURRENCIES), index=list(CURRENCIES).index("USD"))
-    with col2:
-        st.markdown("<div style='text-align:center;padding-top:3rem;font-size:1.5rem'>⇄</div>", unsafe_allow_html=True)
-    with col3:
-        target = st.selectbox("To", list(CURRENCIES), index=list(CURRENCIES).index("INR"))
-    if st.button("Convert currency", type="primary"):
-        try:
-            with st.spinner("Fetching exchange rates…"):
-                rates, updated = currency_rates(base)
-            rate = rates.get(target)
-            if rate is None:
-                st.error(f"No exchange rate was returned for {target}.")
-            else:
-                result = amount * float(rate)
-                st.success(f"{amount:,.2f} {base} = {result:,.2f} {target}")
-                st.write(f"Exchange rate: 1 {base} = {float(rate):,.6f} {target}")
-                st.caption(f"Last updated by provider: {updated}")
-        except RuntimeError as exc:
-            st.error(str(exc))
-
-st.markdown("---")
-st.markdown(
-    '<div class="small-note">Market data is provided by CoinGecko. Data may be delayed or incomplete. '
-    'Technical indicators are educational tools, not reliable standalone trading signals. '
-    'Crypto assets are volatile; this app is not financial advice.</div>',
-    unsafe_allow_html=True,
-)
+    return coin
