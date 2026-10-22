@@ -1,7 +1,8 @@
 streamlit
-langchain
+requests
+pandas
+numpy
+plotly
+python-dotenv
 langchain-groq
 langchain-core
-langchain-community
-langchain-classic
-python-dotenv
